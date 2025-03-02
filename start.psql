@@ -3,7 +3,10 @@
 \echo '   0 – Node & current DB information: master/replica, lag, DB size, tmp files, etc.'
 \echo '   1 – Databases: size, stats'
 \echo '   2 – Tables: table/index/TOAST size, number of rows'
-\echo '   3 – Load profile'
+\echo '   3 – Indexes: size'
+\echo '   4 – Table load profiles'
+\echo '   5 – Long running queries'
+\echo '   6 – Current activity: count of current connections grouped by database, user name, state'
 \echo '  a1 – Current activity: count of current connections grouped by database, user name, state'
 \echo '  b1 – Table bloat (estimated)'
 \echo '  b2 – B-tree index bloat (estimated)'
@@ -34,6 +37,9 @@ select
 :d_stp::text = '1' as d_step_is_1,
 :d_stp::text = '2' as d_step_is_2,
 :d_stp::text = '3' as d_step_is_3,
+:d_stp::text = '4' as d_step_is_4,
+:d_stp::text = '5' as d_step_is_5,
+:d_stp::text = '6' as d_step_is_6,
 :d_stp::text = 'a1' as d_step_is_a1,
 :d_stp::text = 'b1' as d_step_is_b1,
 :d_stp::text = 'b2' as d_step_is_b2,
@@ -59,19 +65,107 @@ select
   \echo 'Bye!'
   \echo
 \elif :d_step_is_0
+  \prompt 'Enter database name (default: CURRENT_DATABASE): ' database 
+  \if `test :'database' = '' && echo 1 || echo 0`   
+    SELECT current_database() AS database \gset
+  \else
+    \set database :database
+  \endif
   \ir ./sql/0_node.sql
-  \prompt 'Press <Enter> to continue…' d_dummy
-  \ir ./start.psql
 \elif :d_step_is_1
+  \prompt 'Enter database name (default: CURRENT_DATABASE): ' database 
+  \if `test :'database' = '' && echo 1 || echo 0`   
+    SELECT current_database() AS database \gset
+  \else
+    \set database :database
+  \endif
   \ir ./sql/1_databases.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_2
+  \prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter table name (default: ALL): ' table
+  \if `test :'table' = '' && echo 1 || echo 0`   
+    \set table '*'
+  \else
+    \set table :table
+  \endif
   \ir ./sql/2_table_sizes.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_3
-  \ir ./sql/3_load_profiles.sql
+  \prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter index name (default: ALL): ' index
+  \if `test :'index' = '' && echo 1 || echo 0`   
+    \set index '*'
+  \else
+    \set index :index
+  \endif
+  \ir ./sql/3_index_sizes.sql
+  \prompt 'Press <Enter> to continue…' d_dummy
+  \ir ./start.psql
+\elif :d_step_is_4
+  \prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter table name (default: ALL): ' table
+  \if `test :'table' = '' && echo 1 || echo 0`   
+    \set table '*'
+  \else
+    \set table :table
+  \endif
+  \ir ./sql/4_table_load_profiles.sql
+  \prompt 'Press <Enter> to continue…' d_dummy
+  \ir ./start.psql
+\elif :d_step_is_5
+  \prompt 'Enter usename (default: ALL): ' usename
+  \if `test :'usename' = '' && echo 1 || echo 0`   
+    \set usename '*'
+  \else
+    \set usename :usename
+  \endif
+  \prompt 'Enter application_name (default: ALL): ' application_name
+  \if `test :'application_name' = '' && echo 1 || echo 0`   
+    \set application_name '*'
+  \else
+    \set application_name :application_name
+  \endif
+  \prompt 'Enter state (default: ALL): ' state
+  \if `test :'state' = '' && echo 1 || echo 0`   
+    \set state '*'
+  \else
+    \set state :state
+  \endif
+  \prompt 'Enter interval (default: 30 seconds): ' interval
+  \if `test :'interval' = '' && echo 1 || echo 0`   
+    \set interval '30 seconds'
+  \else
+    \set interval :interval
+  \endif
+  \prompt 'Enter query (default: ALL): ' query
+  \if `test :'query' = '' && echo 1 || echo 0`   
+    \set query '*'
+  \else
+    \set query :query
+  \endif
+  \ir ./sql/5_long_running_query.sql
+  \prompt 'Press <Enter> to continue…' d_dummy
+  \ir ./start.psql
+\elif :d_step_is_6
+  \ir ./sql/6_activity.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_a1

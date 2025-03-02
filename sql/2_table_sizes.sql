@@ -1,20 +1,37 @@
 --Tables: table/index/TOAST size, number of rows
+\if `test :'schema' = '*' && echo 1 || echo 0`
+  \set show_all_schemas 1
+\else
+  \set show_all_schemas 0
+\endif
 
-with data as (
-  select
+\if `test :'table' = '*' && echo 1 || echo 0`
+  \set show_all_tables 1
+\else
+  \set show_all_tables 0
+\endif
+
+WITH table_info AS (
+  SELECT
     c.oid,
-    (select spcname from pg_tablespace where oid = reltablespace) as tblspace,
-    nspname as schema_name,
-    relname as table_name,
-    c.reltuples as row_estimate,
-    pg_total_relation_size(c.oid) as total_bytes,
-    pg_indexes_size(c.oid) as index_bytes,
-    pg_total_relation_size(reltoastrelid) as toast_bytes,
-    pg_total_relation_size(c.oid) - pg_indexes_size(c.oid) - coalesce(pg_total_relation_size(reltoastrelid), 0) as table_bytes
-  from pg_class c
-  left join pg_namespace n on n.oid = c.relnamespace
-  where relkind = 'r' and nspname <> 'pg_catalog'
-), data2 as (
+    (SELECT spcname FROM pg_tablespace WHERE oid = reltablespace) AS tblspace,
+    nspname AS schema_name,
+    relname AS table_name,
+    c.reltuples AS row_estimate,
+    pg_total_relation_size(c.oid) AS total_bytes,
+    pg_indexes_size(c.oid) AS index_bytes,
+    pg_total_relation_size(reltoastrelid) AS toast_bytes,
+    pg_total_relation_size(c.oid) - pg_indexes_size(c.oid) - COALESCE(pg_total_relation_size(reltoastrelid), 0) AS table_bytes
+  FROM pg_class c
+  LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE relkind = 'r' AND nspname != 'pg_catalog'
+  AND (
+      (:show_all_schemas = 1 AND :show_all_tables = 1)
+      OR (:show_all_schemas = 0 AND nspname = :'schema')
+      OR (:show_all_tables = 0 AND relname = :'table')
+  ) 
+), 
+all_info as (
   select
     null::oid as oid,
     null as tblspace,
@@ -25,51 +42,37 @@ with data as (
     sum(index_bytes) as index_bytes,
     sum(toast_bytes) as toast_bytes,
     sum(table_bytes) as table_bytes
-  from data
-  union all
-  select
-    null::oid as oid,
-    null,
-    null as schema_name,
-    '    tablespace: [' || coalesce(tblspace, 'pg_default') || ']' as table_name,
-    sum(row_estimate) as row_estimate,
-    sum(total_bytes) as total_bytes,
-    sum(index_bytes) as index_bytes,
-    sum(toast_bytes) as toast_bytes,
-    sum(table_bytes) as table_bytes
-  from data
-  where (select count(distinct coalesce(tblspace, 'pg_default')) from data) > 1 -- don't show this part if there are no custom tablespaces
-  group by tblspace
-  union all
-  select null::oid, null, null, null, null, null, null, null, null
-  union all
-  select * from data
+  from table_info
+  HAVING :show_all_schemas = 1 AND :show_all_tables = 1
+
+  UNION ALL
+  SELECT * FROM table_info
 )
-select
-  coalesce(nullif(schema_name, 'public') || '.', '') || table_name || coalesce(' [' || tblspace || ']', '') as "Table",
-  '~' || case
-    when row_estimate > 10^12 then round(row_estimate::numeric / 10^12::numeric, 0)::text || 'T'
-    when row_estimate > 10^9 then round(row_estimate::numeric / 10^9::numeric, 0)::text || 'B'
-    when row_estimate > 10^6 then round(row_estimate::numeric / 10^6::numeric, 0)::text || 'M'
-    when row_estimate > 10^3 then round(row_estimate::numeric / 10^3::numeric, 0)::text || 'k'
-    else row_estimate::text
-  end as "Rows",
-  pg_size_pretty(total_bytes) || ' (' || round(
-    100 * total_bytes::numeric / nullif(sum(total_bytes) over (partition by (schema_name is null), left(table_name, 3) = '***'), 0),
+SELECT
+  COALESCE(schema_name || '.', '') || table_name || COALESCE(' [' || NULLIF(tblspace, 'pg_default') || ']', '') AS "Table",
+  '~' || CASE
+    WHEN row_estimate > 10^12 THEN ROUND(row_estimate::numeric / 10^12::numeric, 0)::text || 'T'
+    WHEN row_estimate > 10^9 THEN ROUND(row_estimate::numeric / 10^9::numeric, 0)::text || 'B'
+    WHEN row_estimate > 10^6 THEN ROUND(row_estimate::numeric / 10^6::numeric, 0)::text || 'M'
+    WHEN row_estimate > 10^3 THEN ROUND(row_estimate::numeric / 10^3::numeric, 0)::text || 'k'
+    ELSE row_estimate::text
+  END AS "Rows",
+  pg_size_pretty(total_bytes) || ' (' || ROUND(
+    100 * total_bytes::numeric / NULLIF(SUM(total_bytes) OVER (PARTITION BY (schema_name IS NULL), LEFT(table_name, 3) = '***'), 0),
     2
-  )::text || '%)' as "Total Size",
-  pg_size_pretty(table_bytes) || ' (' || round(
-    100 * table_bytes::numeric / nullif(sum(table_bytes) over (partition by (schema_name is null), left(table_name, 3) = '***'), 0),
+  )::text || '%)' AS "Total Size",
+  pg_size_pretty(table_bytes) || ' (' || ROUND(
+    100 * table_bytes::numeric / NULLIF(SUM(table_bytes) OVER (PARTITION BY (schema_name IS NULL), LEFT(table_name, 3) = '***'), 0),
     2
-  )::text || '%)' as "Table Size",
-  pg_size_pretty(index_bytes) || ' (' || round(
-    100 * index_bytes::numeric / nullif(sum(index_bytes) over (partition by (schema_name is null), left(table_name, 3) = '***'), 0),
+  )::text || '%)' AS "Table Size",
+  pg_size_pretty(index_bytes) || ' (' || ROUND(
+    100 * index_bytes::numeric / NULLIF(SUM(index_bytes) OVER (PARTITION BY (schema_name IS NULL), LEFT(table_name, 3) = '***'), 0),
     2
-  )::text || '%)' as "Index(es) Size",
-  pg_size_pretty(toast_bytes) || ' (' || round(
-    100 * toast_bytes::numeric / nullif(sum(toast_bytes) over (partition by (schema_name is null), left(table_name, 3) = '***'), 0),
+  )::text || '%)' AS "Index(es) Size",
+  pg_size_pretty(toast_bytes) || ' (' || ROUND(
+    100 * toast_bytes::numeric / NULLIF(SUM(toast_bytes) OVER (PARTITION BY (schema_name IS NULL), LEFT(table_name, 3) = '***'), 0),
     2
-  )::text || '%)' as "TOAST Size"
-from data2
-where schema_name is distinct from 'information_schema'
-order by oid is null desc, total_bytes desc nulls last;
+  )::text || '%)' AS "TOAST Size"
+FROM all_info
+WHERE schema_name != 'information_schema'
+ORDER BY oid IS NULL DESC, total_bytes DESC NULLS LAST;
