@@ -1,146 +1,201 @@
 --B-tree index bloat (estimated)
 
--- enhanced version of https://github.com/ioguix/pgsql-bloat-estimation/blob/master/btree/btree_bloat.sql
-
--- WARNING: executed with a non-superuser role, the query inspect only index on tables you are granted to read.
--- WARNING: rows with is_na = 't' are known to have bad statistics ("name" type is not supported).
--- This query is compatible with PostgreSQL 8.2+
-
-with step1 as (
-  select
-    i.nspname as schema_name,
-    i.tblname as table_name,
-    i.idxname as index_name,
-    i.reltuples,
-    i.relpages,
-    i.relam,
-    a.attrelid AS table_oid,
-    current_setting('block_size')::numeric AS bs,
-    fillfactor,
-    -- MAXALIGN: 4 on 32bits, 8 on 64bits (and mingw32 ?)
-    case when version() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64' then 8 else 4 end as maxalign,
-    /* per page header, fixed size: 20 for 7.X, 24 for others */
-    24 AS pagehdr,
-    /* per page btree opaque data */
-    16 AS pageopqdata,
-    /* per tuple header: add IndexAttributeBitMapData if some cols are null-able */
-    case
-      when max(coalesce(s.null_frac,0)) = 0 then 2 -- IndexTupleData size
-      else 2 + (( 32 + 8 - 1 ) / 8) -- IndexTupleData size + IndexAttributeBitMapData size ( max num filed per index + 8 - 1 /8)
-    end as index_tuple_hdr_bm,
-    /* data len: we remove null values save space using it fractionnal part from stats */
-    sum((1 - coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) as nulldatawidth,
-    max(case when a.atttypid = 'pg_catalog.name'::regtype then 1 else 0 end) > 0 as is_na
-  from pg_attribute as a
-  join (
-    select
-      nspname, tbl.relname AS tblname, idx.relname AS idxname, idx.reltuples, idx.relpages, idx.relam,
-      indrelid, indexrelid, indkey::smallint[] AS attnum,
-      coalesce(substring(array_to_string(idx.reloptions, ' ') from 'fillfactor=([0-9]+)')::smallint, 90) as fillfactor
-    from pg_index
-    join pg_class idx on idx.oid = pg_index.indexrelid
-    join pg_class tbl on tbl.oid = pg_index.indrelid
-    join pg_namespace on pg_namespace.oid = idx.relnamespace
-    where pg_index.indisvalid AND tbl.relkind = 'r' AND idx.relpages > 0
-  ) as i on a.attrelid = i.indexrelid
-  join pg_stats as s on
-    s.schemaname = i.nspname
-    and (
-      (s.tablename = i.tblname and s.attname = pg_catalog.pg_get_indexdef(a.attrelid, a.attnum, true)) -- stats from tbl
-      OR (s.tablename = i.idxname AND s.attname = a.attname) -- stats from functionnal cols
-    )
-  join pg_type as t on a.atttypid = t.oid
-  where a.attnum > 0
-  group by 1, 2, 3, 4, 5, 6, 7, 8, 9
-), step2 as (
-  select
-    *,
-    (
-      index_tuple_hdr_bm + maxalign
-      -- Add padding to the index tuple header to align on MAXALIGN
-      - case when index_tuple_hdr_bm % maxalign = 0 THEN maxalign else index_tuple_hdr_bm % maxalign end
-      + nulldatawidth + maxalign
-      -- Add padding to the data to align on MAXALIGN
-      - case
-          when nulldatawidth = 0 then 0
-          when nulldatawidth::integer % maxalign = 0 then maxalign
-          else nulldatawidth::integer % maxalign
-        end
-    )::numeric as nulldatahdrwidth
-    -- , index_tuple_hdr_bm, nulldatawidth -- (DEBUG INFO)
-  from step1
-), step3 as (
-  select
-    *,
-    -- ItemIdData size + computed avg size of a tuple (nulldatahdrwidth)
-    coalesce(1 + ceil(reltuples / floor((bs - pageopqdata - pagehdr) / (4 + nulldatahdrwidth)::float)), 0) as est_pages,
-    coalesce(1 + ceil(reltuples / floor((bs - pageopqdata - pagehdr) * fillfactor / (100 * (4 + nulldatahdrwidth)::float))), 0) as est_pages_ff
-    -- , stattuple.pgstatindex(quote_ident(nspname)||'.'||quote_ident(idxname)) AS pst, index_tuple_hdr_bm, maxalign, pagehdr, nulldatawidth, nulldatahdrwidth, reltuples -- (DEBUG INFO)
-  from step2
-  join pg_am am on step2.relam = am.oid
-  where am.amname = 'btree'
-), step4 as (
-  SELECT
-    *,
-    bs*(relpages)::bigint AS real_size,
--------current_database(), nspname AS schemaname, tblname, idxname, bs*(relpages)::bigint AS real_size,
-    bs*(relpages-est_pages)::bigint AS extra_size,
-    100 * (relpages-est_pages)::float / relpages AS extra_ratio,
-    bs*(relpages-est_pages_ff) AS bloat_size,
-    100 * (relpages-est_pages_ff)::float / relpages AS bloat_ratio
-    -- , 100-(sub.pst).avg_leaf_density, est_pages, index_tuple_hdr_bm, maxalign, pagehdr, nulldatawidth, nulldatahdrwidth, sub.reltuples, sub.relpages -- (DEBUG INFO)
-  from step3
-  -- WHERE NOT is_na
-)
-select
-  case is_na when true then 'TRUE' else '' end as "Is N/A",
-  format(
-    $out$%s
-  (%s)$out$,
-    left(index_name, 50) || case when length(index_name) > 50 then '…' else '' end,
-    coalesce(nullif(schema_name, 'public') || '.', '') || table_name
-  ) as "Index (Table)",
-  pg_size_pretty(real_size::numeric) as "Size",
-  case
-    when extra_size::numeric >= 0
-      then '~' || pg_size_pretty(extra_size::numeric)::text || ' (' || round(extra_ratio::numeric, 2)::text || '%)'
-    else null
-  end  as "Extra",
-  case
-    when bloat_size::numeric >= 0
-      then '~' || pg_size_pretty(bloat_size::numeric)::text || ' (' || round(bloat_ratio::numeric, 2)::text || '%)'
-    else null
-  end as "Bloat",
-  case
-    when (real_size - bloat_size)::numeric >=0
-      then '~' || pg_size_pretty((real_size - bloat_size)::numeric)
-      else null
-   end as "Live",
-  fillfactor
-from step4
-order by real_size desc nulls last
-;
+-- Enhanced version of https://github.com/ioguix/pgsql-bloat-estimation/blob/master/btree/btree_bloat.sql
 
 /*
-Author of the original version:
-  2015, Jehan-Guillaume (ioguix) de Rorthais
-License of the original version:
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+* WARNING: executed with a non-superuser role, the query inspect only index on tables you are granted to read.
+* WARNING: rows with unreliable statistics are marked with 'TRUE' in the "Unreliable Stats" column.
+*          This happens when the index contains columns of type "name" which is not supported by statistics collector.
+* This query is compatible with PostgreSQL 8.2+
+*
+* Usage:
+* - To check all indexes: \set index '*' \set schema '*'
+* - To check indexes for a specific schema: \set schema 'schema_name' \set index '*'
+* - To check a specific index: \set index 'index_name' \set schema '*'
+* - To check a specific index in a specific schema: \set index 'index_name' \set schema 'schema_name'
 */
 
+\if `test :'schema' = '*' && echo 1 || echo 0`
+  \set show_all_schemas 1
+\else
+  \set show_all_schemas 0
+\endif
+
+\if `test :'index' = '*' && echo 1 || echo 0`
+  \set show_all_indexes 1
+\else
+  \set show_all_indexes 0
+\endif
+
+WITH index_metadata AS (
+    -- Collect basic index metadata and statistics
+    SELECT
+        i.nspname AS schema_name,
+        i.tblname AS table_name,
+        i.idxname AS index_name,
+        i.reltuples,
+        i.relpages,
+        i.relam,
+        a.attrelid AS table_oid,
+        CURRENT_SETTING('block_size')::NUMERIC AS bs,
+        fillfactor,
+        -- MAXALIGN: 4 on 32bits, 8 on 64bits (and mingw32 ?)
+        CASE 
+            WHEN VERSION() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64' THEN 8 
+            ELSE 4 
+        END AS maxalign,
+        /* per page header, fixed size: 20 for 7.X, 24 for others */
+        24 AS pagehdr,
+        /* per page btree opaque data */
+        16 AS pageopqdata,
+        /* per tuple header: add IndexAttributeBitMapData if some cols are null-able */
+        CASE
+            WHEN MAX(COALESCE(s.null_frac, 0)) = 0 THEN 2 -- IndexTupleData size
+            ELSE 2 + ((32 + 8 - 1) / 8) -- IndexTupleData size + IndexAttributeBitMapData size (max num field per index + 8 - 1) / 8
+        END AS index_tuple_hdr_bm,
+        /* data len: we remove null values save space using it fractional part from stats */
+        SUM((1 - COALESCE(s.null_frac, 0)) * COALESCE(s.avg_width, 1024)) AS nulldatawidth,
+        MAX(CASE WHEN a.atttypid = 'pg_catalog.name'::REGTYPE THEN 1 ELSE 0 END) > 0 AS is_na
+    FROM 
+        pg_attribute AS a
+        JOIN (
+            SELECT
+                nspname, 
+                tbl.relname AS tblname, 
+                idx.relname AS idxname, 
+                idx.reltuples, 
+                idx.relpages, 
+                idx.relam,
+                indrelid, 
+                indexrelid, 
+                indkey::SMALLINT[] AS attnum,
+                COALESCE(
+                    SUBSTRING(
+                        ARRAY_TO_STRING(idx.reloptions, ' ') 
+                        FROM 'fillfactor=([0-9]+)'
+                    )::SMALLINT, 
+                    90
+                ) AS fillfactor
+            FROM 
+                pg_index
+                JOIN pg_class idx ON idx.oid = pg_index.indexrelid
+                JOIN pg_class tbl ON tbl.oid = pg_index.indrelid
+                JOIN pg_namespace ON pg_namespace.oid = idx.relnamespace
+            WHERE 
+                pg_index.indisvalid 
+                AND tbl.relkind = 'r' 
+                AND idx.relpages > 0
+                -- Exclude system schemas
+                AND nspname NOT IN ('pg_catalog', 'information_schema')
+                AND (
+                    (:show_all_schemas = 1 AND :show_all_indexes = 1)
+                    OR (:show_all_schemas = 0 AND nspname = :'schema')
+                    OR (:show_all_indexes = 0 AND idx.relname = :'index')
+                    OR (nspname = :'schema' AND idx.relname = :'index')
+                )
+        ) AS i ON a.attrelid = i.indexrelid
+        JOIN pg_stats AS s ON
+            s.schemaname = i.nspname
+            AND (
+                (s.tablename = i.tblname AND s.attname = pg_catalog.pg_get_indexdef(a.attrelid, a.attnum, TRUE)) -- stats from tbl
+                OR (s.tablename = i.idxname AND s.attname = a.attname) -- stats from functional cols
+            )
+        JOIN pg_type AS t ON a.atttypid = t.oid
+    WHERE 
+        a.attnum > 0
+    GROUP BY 
+        1, 2, 3, 4, 5, 6, 7, 8, 9
+), 
+tuple_size_calculation AS (
+    -- Calculate tuple size with alignment considerations
+    SELECT
+        *,
+        (
+            index_tuple_hdr_bm + maxalign
+            -- Add padding to the index tuple header to align on MAXALIGN
+            - CASE 
+                WHEN index_tuple_hdr_bm % maxalign = 0 THEN maxalign 
+                ELSE index_tuple_hdr_bm % maxalign 
+              END
+            + nulldatawidth + maxalign
+            -- Add padding to the data to align on MAXALIGN
+            - CASE
+                WHEN nulldatawidth = 0 THEN 0
+                WHEN nulldatawidth::INTEGER % maxalign = 0 THEN maxalign
+                ELSE nulldatawidth::INTEGER % maxalign
+              END
+        )::NUMERIC AS nulldatahdrwidth
+    FROM 
+        index_metadata
+), 
+page_count_estimation AS (
+    -- Estimate the number of pages needed for the index
+    SELECT
+        *,
+        -- ItemIdData size + computed avg size of a tuple (nulldatahdrwidth)
+        COALESCE(
+            1 + CEIL(
+                reltuples / FLOOR(
+                    (bs - pageopqdata - pagehdr) / (4 + nulldatahdrwidth)::FLOAT
+                )
+            ), 
+            0
+        ) AS est_pages,
+        COALESCE(
+            1 + CEIL(
+                reltuples / FLOOR(
+                    (bs - pageopqdata - pagehdr) * fillfactor / (100 * (4 + nulldatahdrwidth)::FLOAT)
+                )
+            ), 
+            0
+        ) AS est_pages_ff
+    FROM 
+        tuple_size_calculation
+        JOIN pg_am am ON tuple_size_calculation.relam = am.oid
+    WHERE 
+        am.amname = 'btree'
+), 
+bloat_calculation AS (
+    -- Calculate bloat size and ratio
+    SELECT
+        *,
+        bs * (relpages)::BIGINT AS real_size,
+        bs * (relpages - est_pages)::BIGINT AS extra_size,
+        100 * (relpages - est_pages)::FLOAT / NULLIF(relpages, 0) AS extra_ratio,
+        bs * (relpages - est_pages_ff) AS bloat_size,
+        100 * (relpages - est_pages_ff)::FLOAT / NULLIF(relpages, 0) AS bloat_ratio
+    FROM 
+        page_count_estimation
+)
+-- Format final output
+SELECT
+    -- Mark indexes with unreliable statistics (indexes with 'name' type columns)
+    CASE is_na 
+        WHEN TRUE THEN 'TRUE' 
+        ELSE 'FALSE' 
+    END AS "Unreliable Stats",
+    schema_name || '.' || table_name AS "Table",
+    LEFT(index_name, 50) || CASE WHEN LENGTH(index_name) > 50 THEN '…' ELSE '' END AS "Index",
+    PG_SIZE_PRETTY(real_size::NUMERIC) AS "Size",
+    CASE
+        WHEN extra_size::NUMERIC >= 0
+            THEN '~' || PG_SIZE_PRETTY(extra_size::NUMERIC)::TEXT || 
+                 ' (' || ROUND(extra_ratio::NUMERIC, 2)::TEXT || '%)'
+        ELSE NULL
+    END AS "Extra",
+    CASE
+        WHEN bloat_size::NUMERIC >= 0
+            THEN '~' || PG_SIZE_PRETTY(bloat_size::NUMERIC)::TEXT || 
+                 ' (' || ROUND(bloat_ratio::NUMERIC, 2)::TEXT || '%)'
+        ELSE NULL
+    END AS "Bloat",
+    CASE
+        WHEN (real_size - bloat_size)::NUMERIC >= 0
+            THEN '~' || PG_SIZE_PRETTY((real_size - bloat_size)::NUMERIC)
+        ELSE NULL
+    END AS "Live",
+    fillfactor AS "Fillfactor"
+FROM 
+    bloat_calculation
+ORDER BY 
+    real_size DESC NULLS LAST;

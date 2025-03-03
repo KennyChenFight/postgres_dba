@@ -1,128 +1,186 @@
---Table bloat (estimated)
-
---This SQL is derived from https://github.com/ioguix/pgsql-bloat-estimation/blob/master/table/table_bloat.sql
+-- Table bloat (estimated)
+-- This SQL is derived from https://github.com/ioguix/pgsql-bloat-estimation/blob/master/table/table_bloat.sql
 
 /*
 * WARNING: executed with a non-superuser role, the query inspect only tables you are granted to read.
 * This query is compatible with PostgreSQL 9.0 and more
 */
 
+\if `test :'schema' = '*' && echo 1 || echo 0`
+  \set show_all_schemas 1
+\else
+  \set show_all_schemas 0
+\endif
 
-with step1 as (
-  select
-    tbl.oid tblid,
-    ns.nspname as schema_name,
-    tbl.relname as table_name,
-    tbl.reltuples,
-    tbl.relpages as heappages,
-    coalesce(toast.relpages, 0) as toastpages,
-    coalesce(toast.reltuples, 0) as toasttuples,
-    coalesce(substring(array_to_string(tbl.reloptions, ' ') from '%fillfactor=#"__#"%' for '#')::int2, 100) as fillfactor,
-    current_setting('block_size')::numeric as bs,
-    case when version() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64' then 8 else 4 end as ma, -- NS: TODO: check it
-    24 as page_hdr,
-    23 + case when max(coalesce(null_frac, 0)) > 0 then (7 + count(*)) / 8 else 0::int end
-      + case when bool_or(att.attname = 'oid' and att.attnum < 0) then 4 else 0 end as tpl_hdr_size,
-    sum((1 - coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) as tpl_data_size,
-    bool_or(att.atttypid = 'pg_catalog.name'::regtype)
-      or sum(case when att.attnum > 0 then 1 else 0 end) <> count(s.attname) as is_na
-  from pg_attribute as att
-  join pg_class as tbl on att.attrelid = tbl.oid and tbl.relkind = 'r'
-  join pg_namespace as ns on ns.oid = tbl.relnamespace
-  join pg_stats as s on s.schemaname = ns.nspname and s.tablename = tbl.relname and not s.inherited and s.attname = att.attname
-  left join pg_class as toast on tbl.reltoastrelid = toast.oid
-  where not att.attisdropped and s.schemaname not in ('pg_catalog', 'information_schema')
-  group by 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-  order by 2, 3
-), step2 as (
-  select
-    *,
-    (
-      4 + tpl_hdr_size + tpl_data_size + (2 * ma)
-      - case when tpl_hdr_size % ma = 0 then ma else tpl_hdr_size % ma end
-      - case when ceil(tpl_data_size)::int % ma = 0 then ma else ceil(tpl_data_size)::int % ma end
-    ) as tpl_size,
-    bs - page_hdr as size_per_block,
-    (heappages + toastpages) as tblpages
-  from step1
-), step3 as (
-  select
-    *,
-    ceil(reltuples / ((bs - page_hdr) / tpl_size)) + ceil(toasttuples / 4) as est_tblpages,
-    ceil(reltuples / ((bs - page_hdr) * fillfactor / (tpl_size * 100))) + ceil(toasttuples / 4) as est_tblpages_ff
-    -- , stattuple.pgstattuple(tblid) as pst
-  from step2
-), step4 as (
-  select
-    *,
-    tblpages * bs as real_size,
-    (tblpages - est_tblpages) * bs as extra_size,
-    case when tblpages - est_tblpages > 0 then 100 * (tblpages - est_tblpages) / tblpages::float else 0 end as extra_ratio,
-    (tblpages - est_tblpages_ff) * bs as bloat_size,
-    case when tblpages - est_tblpages_ff > 0 then 100 * (tblpages - est_tblpages_ff) / tblpages::float else 0 end as bloat_ratio
-    -- , (pst).free_percent + (pst).dead_tuple_percent as real_frag
-  from step3
-  left join pg_stat_user_tables su on su.relid = tblid
-  -- WHERE NOT is_na
-  --   AND tblpages*((pst).free_percent + (pst).dead_tuple_percent)::float4/100 >= 1
+\if `test :'table' = '*' && echo 1 || echo 0`
+  \set show_all_tables 1
+\else
+  \set show_all_tables 0
+\endif
+
+WITH table_metadata AS (
+    -- 收集表的基本元數據和統計信息
+    SELECT
+        tbl.oid AS tblid,
+        ns.nspname AS schema_name,
+        tbl.relname AS table_name,
+        tbl.reltuples,
+        tbl.relpages AS heappages,
+        COALESCE(toast.relpages, 0) AS toastpages,
+        COALESCE(toast.reltuples, 0) AS toasttuples,
+        COALESCE(
+            SUBSTRING(
+                ARRAY_TO_STRING(tbl.reloptions, ' ') 
+                FROM '%fillfactor=#"__#"%' FOR '#'
+            )::INT2, 
+            100
+        ) AS fillfactor,
+        CURRENT_SETTING('block_size')::NUMERIC AS bs,
+        CASE 
+            WHEN VERSION() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64' THEN 8 
+            ELSE 4 
+        END AS ma,
+        24 AS page_hdr,
+        23 + CASE 
+                WHEN MAX(COALESCE(null_frac, 0)) > 0 THEN (7 + COUNT(*)) / 8 
+                ELSE 0::INT 
+             END
+           + CASE 
+                WHEN BOOL_OR(att.attname = 'oid' AND att.attnum < 0) THEN 4 
+                ELSE 0 
+             END AS tpl_hdr_size,
+        SUM(
+            (1 - COALESCE(s.null_frac, 0)) * COALESCE(s.avg_width, 1024)
+        ) AS tpl_data_size,
+        BOOL_OR(att.atttypid = 'pg_catalog.name'::REGTYPE)
+            OR SUM(CASE WHEN att.attnum > 0 THEN 1 ELSE 0 END) <> COUNT(s.attname) AS is_na
+    FROM 
+        pg_attribute AS att
+        JOIN pg_class AS tbl 
+            ON att.attrelid = tbl.oid 
+            AND tbl.relkind = 'r'
+        JOIN pg_namespace AS ns 
+            ON ns.oid = tbl.relnamespace
+        JOIN pg_stats AS s 
+            ON s.schemaname = ns.nspname 
+            AND s.tablename = tbl.relname 
+            AND NOT s.inherited 
+            AND s.attname = att.attname
+        LEFT JOIN pg_class AS toast 
+            ON tbl.reltoastrelid = toast.oid
+    WHERE 
+        NOT att.attisdropped 
+        AND s.schemaname NOT IN ('pg_catalog', 'information_schema')
+        AND (
+            (:show_all_schemas = 1 AND :show_all_tables = 1)
+            OR (:show_all_schemas = 0 AND ns.nspname = :'schema')
+            OR (:show_all_tables = 0 AND tbl.relname = :'table')
+            OR (ns.nspname = :'schema' AND tbl.relname = :'table')
+        )
+    GROUP BY 
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+    ORDER BY 
+        2, 3
+),
+tuple_size_calculation AS (
+    -- 計算元組大小和每個塊可存儲的數據量
+    SELECT
+        *,
+        (
+            4 + tpl_hdr_size + tpl_data_size + (2 * ma)
+            - CASE 
+                WHEN tpl_hdr_size % ma = 0 THEN ma 
+                ELSE tpl_hdr_size % ma 
+              END
+            - CASE 
+                WHEN CEIL(tpl_data_size)::INT % ma = 0 THEN ma 
+                ELSE CEIL(tpl_data_size)::INT % ma 
+              END
+        ) AS tpl_size,
+        bs - page_hdr AS size_per_block,
+        (heappages + toastpages) AS tblpages
+    FROM 
+        table_metadata
+),
+page_count_estimation AS (
+    -- 估計表實際需要的頁面數
+    SELECT
+        *,
+        CEIL(reltuples / ((bs - page_hdr) / tpl_size)) + 
+            CEIL(toasttuples / 4) AS est_tblpages,
+        CEIL(reltuples / ((bs - page_hdr) * fillfactor / (tpl_size * 100))) + 
+            CEIL(toasttuples / 4) AS est_tblpages_ff
+    FROM 
+        tuple_size_calculation
+),
+bloat_calculation AS (
+    -- 計算膨脹大小和比率
+    SELECT
+        *,
+        tblpages * bs AS real_size,
+        (tblpages - est_tblpages) * bs AS extra_size,
+        CASE 
+            WHEN tblpages - est_tblpages > 0 
+                THEN 100 * (tblpages - est_tblpages) / tblpages::FLOAT 
+            ELSE 0 
+        END AS extra_ratio,
+        (tblpages - est_tblpages_ff) * bs AS bloat_size,
+        CASE 
+            WHEN tblpages - est_tblpages_ff > 0 
+                THEN 100 * (tblpages - est_tblpages_ff) / tblpages::FLOAT 
+            ELSE 0 
+        END AS bloat_ratio
+    FROM 
+        page_count_estimation
+        LEFT JOIN pg_stat_user_tables su 
+            ON su.relid = tblid
 )
-select
-  case is_na when true then 'TRUE' else '' end as "Is N/A",
-  coalesce(nullif(schema_name, 'public') || '.', '') || table_name as "Table",
-  pg_size_pretty(real_size::numeric) as "Size",
-  case
-    when extra_size::numeric >= 0
-      then '~' || pg_size_pretty(extra_size::numeric)::text || ' (' || round(extra_ratio::numeric, 2)::text || '%)'
-    else null
-  end  as "Extra",
-  case
-    when bloat_size::numeric >= 0
-      then '~' || pg_size_pretty(bloat_size::numeric)::text || ' (' || round(bloat_ratio::numeric, 2)::text || '%)'
-    else null
-  end as "Bloat estimate",
-  case
-    when (real_size - bloat_size)::numeric >=0
-      then '~' || pg_size_pretty((real_size - bloat_size)::numeric)
-      else null
-   end as "Live",
-  greatest(last_autovacuum, last_vacuum)::timestamp(0)::text 
-    || case greatest(last_autovacuum, last_vacuum)
-      when last_autovacuum then ' (auto)'
-    else '' end as "Last Vaccuum",
-  (
-    select
-      coalesce(substring(array_to_string(reloptions, ' ') from 'fillfactor=([0-9]+)')::smallint, 100)
-    from pg_class
-    where oid = tblid
-  ) as "Fillfactor"
-from step4
-order by bloat_size desc nulls last
-;
-
-/*
-Author of the original version:
-  2015, Jehan-Guillaume (ioguix) de Rorthais
-
-License of the original version:
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+-- 格式化最終輸出結果
+SELECT
+    -- Mark tables with unreliable statistics (tables with 'name' type columns or incomplete stats)
+    CASE is_na 
+        WHEN TRUE THEN 'TRUE' 
+        ELSE 'FALSE' 
+    END AS "Unreliable Stats",
+    schema_name || '.' || table_name AS "Table",
+    PG_SIZE_PRETTY(real_size::NUMERIC) AS "Size",
+    CASE
+        WHEN extra_size::NUMERIC >= 0
+            THEN '~' || PG_SIZE_PRETTY(extra_size::NUMERIC)::TEXT || 
+                 ' (' || ROUND(extra_ratio::NUMERIC, 2)::TEXT || '%)'
+        ELSE NULL
+    END AS "Extra",
+    CASE
+        WHEN bloat_size::NUMERIC >= 0
+            THEN '~' || PG_SIZE_PRETTY(bloat_size::NUMERIC)::TEXT || 
+                 ' (' || ROUND(bloat_ratio::NUMERIC, 2)::TEXT || '%)'
+        ELSE NULL
+    END AS "Bloat estimate",
+    CASE
+        WHEN (real_size - bloat_size)::NUMERIC >= 0
+            THEN '~' || PG_SIZE_PRETTY((real_size - bloat_size)::NUMERIC)
+        ELSE NULL
+    END AS "Live",
+    GREATEST(last_autovacuum, last_vacuum)::TIMESTAMP(0)::TEXT || 
+        CASE GREATEST(last_autovacuum, last_vacuum)
+            WHEN last_autovacuum THEN ' (auto)'
+            ELSE '' 
+        END AS "Last Vaccuum",
+    (
+        SELECT
+            COALESCE(
+                SUBSTRING(
+                    ARRAY_TO_STRING(reloptions, ' ') 
+                    FROM 'fillfactor=([0-9]+)'
+                )::SMALLINT, 
+                100
+            )
+        FROM 
+            pg_class
+        WHERE 
+            oid = tblid
+    ) AS "Fillfactor"
+FROM 
+    bloat_calculation
+ORDER BY 
+    bloat_size DESC NULLS LAST;

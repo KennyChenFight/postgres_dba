@@ -173,18 +173,66 @@ select
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_b1
+  \prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter table name (default: ALL): ' table
+  \if `test :'table' = '' && echo 1 || echo 0`   
+    \set table '*'
+  \else
+    \set table :table
+  \endif
   \ir ./sql/b1_table_estimation.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_b2
+  \prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter index name (default: ALL): ' index
+  \if `test :'index' = '' && echo 1 || echo 0`   
+    \set index '*'
+  \else
+    \set index :index
+  \endif 
   \ir ./sql/b2_btree_estimation.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_b3
+\prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter table name (default: ALL): ' table
+  \if `test :'table' = '' && echo 1 || echo 0`   
+    \set table '*'
+  \else
+    \set table :table
+  \endif
   \ir ./sql/b3_table_pgstattuple.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
 \elif :d_step_is_b4
+  \prompt 'Enter schema name (default: ALL): ' schema
+  \if `test :'schema' = '' && echo 1 || echo 0`   
+    \set schema '*'
+  \else
+    \set schema :schema
+  \endif
+  \prompt 'Enter index name (default: ALL): ' index
+  \if `test :'index' = '' && echo 1 || echo 0`   
+    \set index '*'
+  \else
+    \set index :index
+  \endif 
   \ir ./sql/b4_btree_pgstattuple.sql
   \prompt 'Press <Enter> to continue…' d_dummy
   \ir ./start.psql
